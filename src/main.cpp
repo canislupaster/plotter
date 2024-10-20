@@ -1,50 +1,91 @@
 #include <Arduino.h>
 #include <Servo.h>
 
-const int shield_pin = 8, servo_pin=11;
+#ifdef DUE
+Serial_& serial = SerialUSB;
+#else
+Serial_& serial = Serial;
+#endif
+
+constexpr int shield_pin = 8, servo_pin=11;
 
 struct Pen {
 	Servo pen;
-	bool is_up=false;
+	enum {Up, Down, None} state = None;
 
 	unsigned long pen_last_down;
 	bool can_move;
-	const unsigned long pen_delay = 100;
+
+	static constexpr unsigned long long pen_ease = 500;
+	static constexpr unsigned long long pen_delay = 100;
+
+	static constexpr int pen_up=15, pen_down=76;
+
+	int pen_last=0, pen_d=0;
 
 	void init() {
-		pen.attach(servo_pin), up();
+		pen.attach(servo_pin);
+		pen.write(0);
+		up();
+	}
+
+	int calc(unsigned long long t) {
+		if (t>=pen_ease) return pen_last+pen_d;
+
+		t = pen_ease-t;
+		long long den = pen_ease*pen_ease*pen_ease;
+		long long coeff = den - t*t*t;
+		
+		return pen_last + (coeff*(long long)pen_d)/den;
+	}
+
+	void set(int amt) {
+		set_target(amt);
+		state=None;
+
+		serial.print("pen at "), serial.println(amt);
 	}
 
 	void up() {
-		if (is_up) return;
+		if (state==Up) return;
 
-		pen.write(0);
-		pen_last_down=millis();
-		can_move=false;
-		is_up=true;
-		Serial.println("pen up");
+		set_target(pen_up);
+		state=Up;
+		serial.println("pen up");
 	}
 
 	void down() {
-		if (!is_up) return;
+		if (state==Down) return;
 
-		pen.write(90);
+		set_target(pen_down);
+		state=Down;
+		serial.println("pen down");
+	}
+
+	void set_target(int v) {
+		pen_last=pen.read();
+		pen_d = v-pen_last;
 		pen_last_down=millis();
 		can_move=false;
-		is_up=false;
-		Serial.println("pen down");
 	}
 
 	bool check_can_move() {
-		if (!can_move)
-			can_move=millis()-pen_last_down >= pen_delay;
+		if (!can_move) {
+			unsigned long ms = millis()-pen_last_down;
+
+			int to = calc(ms);
+			pen.write(to);
+
+			if (ms >= pen_ease+pen_delay) can_move=true;
+		}
+
 		return can_move;
 	}
 };
 
 template<int pin, int dir_pin>
 struct Stepper {
-	static const int pulse_delay = 1;
+	static constexpr int pulse_delay = 1;
 
 	void init() {
 		pinMode(pin, OUTPUT);
@@ -63,8 +104,8 @@ struct Stepper {
 struct Pt: Printable {
 	long x, y;
 
-	Pt(): x(0), y(0) {}
-	Pt(long x_, long y_): x(x_), y(y_) {}
+	constexpr Pt(): x(0), y(0) {}
+	constexpr Pt(long x_, long y_): x(x_), y(y_) {}
 
 	bool operator==(Pt const& o) const { return x==o.x && y==o.y; }
 	bool operator!=(Pt const& o) const { return x!=o.x || y!=o.y; }
@@ -82,8 +123,8 @@ struct Pt: Printable {
 	}
 };
 
-const Pt limit(29875, 24421);
-const int default_delay = 10000;
+constexpr Pt limit(29875, 24421);
+constexpr int default_delay = 10000;
 
 struct Save {
 	Pt cur, to;
@@ -168,7 +209,7 @@ struct Cur {
 
 		us = (1000000ll*l)/(manhattan_len*speed);
 
-		// Serial.print("from "), Serial.print(from), Serial.print(", to "), Serial.print(to), Serial.print(", us "), Serial.println(us);
+		// serial.print("from "), serial.print(from), serial.print(", to "), serial.print(to), serial.print(", us "), serial.println(us);
 	}
 
 	void delay() {
@@ -178,7 +219,8 @@ struct Cur {
 	}
 	
 	Pt step_dir() {
-		if (cur==to || !p->check_can_move()) return Pt(0,0);
+		bool can_move = p->check_can_move();
+		if (cur==to || !can_move) return Pt(0,0);
 
 		Pt ret(0,0);
 
@@ -205,7 +247,7 @@ struct Cur {
 
 		//can exceed limits by 1/2 step
 		if (floor_cur.x<0 || floor_cur.y<0 || floor_cur.x>limit.x || floor_cur.y>limit.y) {
-			Serial.println("out of bounds!");
+			serial.println("out of bounds!");
 			init(cur, 0);
 			return {0,0};
 		}
@@ -214,11 +256,14 @@ struct Cur {
 	}
 };
 
-const int npt=300;
-const int default_speed=600;
-const int move_speed=700;
+constexpr int npt=300;
+constexpr int default_speed=2400;
+constexpr int move_speed=3200;
 
 Save paused;
+
+Pen p;
+Cur cur;
 
 struct Move {
 	enum Ty {Linear, Bezier, None} ty;
@@ -231,6 +276,8 @@ struct Move {
 
 	Move(Ty ty, Pt from, Pt ctrl1, Pt ctrl2, Pt to, int speed, int t, bool stay_down):
 		ty(ty), from(from), ctrl1(ctrl1), ctrl2(ctrl2), to(to), speed(speed), t(t), stay_down(stay_down) {}
+
+	Move(): ty(None), from({0,0}), ctrl1({0,0}), ctrl2({0,0}), to({0,0}), speed(0), t(0), stay_down(false) {}
 
 	static Move linear(Pt* pts, int speed, bool stay_down) {
 		return Move(Linear, pts[0], {0,0}, {0,0}, pts[1], speed, 0, stay_down);
@@ -262,20 +309,17 @@ struct Move {
 	}
 
 	void next() {
-		if (is_paused) return;
-
 		if (restore_cur) {
 			cur.init_from(paused);
 			restore_cur=false;
 		}
 
 		if (!started) {
-			started=true;
-
 			if (cur.cur!=from) {
 				p.up();
 				cur.init(from, move_speed);
 			} else {
+				started=true;
 				next();
 			}
 
@@ -287,7 +331,7 @@ struct Move {
 
 		if ((ty==Move::Linear || t>=npt) && cur.cur==to) {
 			if (!stay_down) p.up();
-			Serial.println("done");
+			serial.println("done");
 			ty=None;
 		} else {
 			p.down();
@@ -295,13 +339,13 @@ struct Move {
 	}
 
 	void pause() {
-		is_paused=true;
-		if (started && cur.cur!=cur.to) {
+		if (!is_paused && started && cur.cur!=cur.to) {
 			paused=cur.save();
 			restore_cur=true;
-
-			cur.init(cur.cur, 0);
 		}
+
+		is_paused=true;
+		cur.init(cur.cur, 0);
 	}
 
 	void resume() {
@@ -322,18 +366,20 @@ Move move;
 Stepper<2,5> x;
 Stepper<3,6> y;
 
-Pen p;
-Cur cur;
-
 void setup() {
-	Serial.println("init");
-	Serial.setTimeout(0);
-	
 	cur.p = &p;
 	cur.init({0,0}, 0);
 	move.ty = Move::None;
 
-	Serial.begin(9600);
+#if DUE
+	SerialUSB.begin(230400);
+#else
+	serial.begin(9600);
+#endif
+
+	serial.println("init");
+	serial.setTimeout(0);
+	
 	x.init(), y.init(), p.init();
 
 	pinMode(shield_pin, OUTPUT);
@@ -357,24 +403,25 @@ struct Parser {
 
 	Pt parse_pt() {
 		Pt o;
-		skip_ws();
 		o.x = strtol(x, const_cast<char**>(&x), 10);
 
 		if (*x != ',') {
-			Serial.println("expected comma");
+			serial.println("expected comma");
 			bad=true;
 			return o;
 		}
 
 		x++;
 		o.y = strtol(x, const_cast<char**>(&x), 10);
+	
+		return o;
 	}
 
 	void expect_end() {
 		if (*x=='\r') x++;
 		if (*x) {
-			Serial.print("expected end of input, got \"");
-			Serial.print(x), Serial.println("\"");
+			serial.print("expected end of input, got \"");
+			serial.print(x), serial.println("\"");
 			bad=true;
 			return;
 		}
@@ -383,7 +430,7 @@ struct Parser {
 
 template<typename T, size_t N>
 struct Dequeue {
-	using n = N;
+	static constexpr size_t n = N;
 
 	T arr[n];
 	int head=0, tail=0;
@@ -406,27 +453,27 @@ struct Dequeue {
 };
 
 unsigned long input_last = 0;
-const unsigned long input_interval = 500;
+constexpr unsigned long input_interval = 500;
 char inp_buf[200];
 char* inp_pt=inp_buf;
 
-Dequeue<Move, 5> next_moves;
+Dequeue<Move, 10> next_moves;
 
 void handle_input() {
 	if (millis()-input_last > input_interval) {
 		input_last = millis();
 
-		Serial.print("STATE ");
-		Serial.print(cur.cur), Serial.print(" "), Serial.print(cur.from),
-			Serial.print(" "), Serial.print(cur.to),
-			Serial.print(" "), Serial.println(!p.is_up);
+		serial.print("STATE ");
+		serial.print(cur.cur), serial.print(" "), serial.print(cur.from),
+			serial.print(" "), serial.print(cur.to),
+			serial.print(" "), serial.println(p.state==Pen::Down);
 	}
 
-	if (Serial.available()==0) return;
+	if (serial.available()==0) return;
 
 	bool end=false;
 	while (inp_pt < inp_buf + sizeof(inp_buf)) {
-		int c = Serial.read();
+		int c = serial.read();
 
 		if (c<0) break;
 		else if (c=='\n') {end=true; break;}
@@ -436,7 +483,7 @@ void handle_input() {
 
 	if (!end) {
 		if (inp_pt == inp_buf + sizeof(inp_buf)) {
-			Serial.println("input buffer full, retry");
+			serial.println("input buffer full, retry");
 			inp_pt = inp_buf;
 		}
 
@@ -444,13 +491,19 @@ void handle_input() {
 	}
 
 	*inp_pt = 0, inp_pt = inp_buf;
-	// Serial.print("got \""), Serial.print(inp_buf); Serial.println("\"");
+	// serial.print("got \""), serial.print(inp_buf); serial.println("\"");
 
 	Parser parse(inp_buf);
 	parse.skip_ws();
 
 	bool cancel = parse.starts_with("cancel");
-	bool go = parse.starts_with("go");
+
+	auto check_busy = []() {
+		if (move.ty!=Move::None && !move.is_paused) {
+			serial.println("busy");
+			return true;
+		} else return false;
+	};
 
 	if (cancel || parse.starts_with("reset")) {
 		move.ty = Move::None;
@@ -466,41 +519,53 @@ void handle_input() {
 
 	} else if (parse.starts_with("pause")) {
 		if (move.ty!=Move::None) move.pause();
+		p.up();
+
 	} else if (parse.starts_with("resume")) {
 		if (move.ty!=Move::None) move.resume();
 
+	}	else if (parse.starts_with("pen")) {
+		if (check_busy()) return;
+
+		parse.skip_ws();
+		int amt = strtol(parse.x, const_cast<char**>(&parse.x), 10);
+		parse.skip_ws();
+		parse.expect_end();
+		if (parse.bad) return;
+
+		p.set(amt);
+
 	//jogging only when no active move
-	} else if (go || parse.starts_with("halt")) {
-		if (move.ty!=Move::None) {
-			Serial.println("busy");
-			return;
-		}
+	} else if (parse.starts_with("go")) {
+		if (check_busy()) return;
 
-		if (go) {
-			Pt to = parse.parse_pt();
-			if (parse.bad) return;
+		Pt to = parse.parse_pt();
+		if (parse.bad) return;
 
-			cur.init(to, move_speed);
-		} else {
-			cur.init(cur.cur, 0);
-		}
+		cur.init(to, move_speed);
+
+	} else if (parse.starts_with("halt")) {
+		if (check_busy()) return;
+
+		cur.init(cur.cur, 0);
 
 	} else {
 		bool is_line = parse.starts_with("l");
 
 		Pt pts[4];
-		for (int i=0; i<is_line ? 2 : 4; i++) {
+		for (int i=0; i<(is_line ? 2 : 4); i++) {
 			parse.skip_ws();
 			pts[i] = parse.parse_pt();
 		}
 
+		parse.skip_ws();
 		bool stay_down = parse.starts_with("stay_down");
 		parse.skip_ws(), parse.expect_end();
 
 		if (parse.bad) return;
 		
 		if (next_moves.full()) {
-			Serial.println("busy");
+			serial.println("busy");
 			return;
 		}
 
@@ -508,8 +573,8 @@ void handle_input() {
 		else next_moves.push(Move::bezier(pts, default_speed, stay_down));
 
 		// Move& next = next_moves.arr[next_moves.tail==0 ? next_moves.n-1 : next_moves.tail-1];
-		// Serial.println("got move");
-		// Serial.print("from: "), Serial.print(next.from), Serial.print(", ctrl1: "), Serial.print(next.ctrl1), Serial.print(", ctrl2: "), Serial.print(next.ctrl2), Serial.print(", to: "), Serial.print(next.to), Serial.print(", stay_down: "), Serial.println(next.stay_down);
+		// serial.println("got move");
+		// serial.print("from: "), serial.print(next.from), serial.print(", ctrl1: "), serial.print(next.ctrl1), serial.print(", ctrl2: "), serial.print(next.ctrl2), serial.print(", to: "), serial.print(next.to), serial.print(", stay_down: "), serial.println(next.stay_down);
 	}
 }
 
@@ -522,7 +587,7 @@ void loop() {
 		}
 
 		if (cur.cur==cur.to) {
-			if (move.ty==Move::None) {
+			if (move.ty==Move::None || move.is_paused) {
 				cur.init(cur.cur, 0);
 				break;
 			} else {
